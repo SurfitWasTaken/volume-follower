@@ -1,0 +1,13 @@
+# Data and Output
+data/*.csv
+output/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# MacOS
+.DS_Store

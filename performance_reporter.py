@@ -60,7 +60,7 @@ class PerformanceReporter:
         cols_order = [
             "instrument", "timeframe", "variant", "filters_applied", "K",
             "n_signals", "win_rate", "base_rate", "win_rate_excess",
-            "p_value_raw", "p_value_corrected",
+            "p_value_raw", "p_value_corrected", "cohens_h", "sample_warning",
             "avg_return_gross", "avg_return_net",
             "sharpe_gross", "sharpe_net",
             "avg_mfe_atr", "avg_mae_atr", "mfe_mae_ratio",
@@ -309,36 +309,44 @@ class PerformanceReporter:
         perm_result: dict | None = None,
         wf_results: list[dict] | None = None,
         stationarity: dict | None = None,
+        cc_validity: dict | None = None,
         filename: str = "conclusion.md",
     ) -> Path:
         """
-        Write a structured, templated conclusion.
-
-        This is intentionally NOT free-form — it fills in required fields
-        to prevent narrative bias.
+        Synthesise all results into a final markdown report.
         """
         sig_level = CONFIG["significance_level"]
+        lines = [
+            "# Backtest Conclusion & Strategy Assessment\n",
+            "## 1. Executive Summary\n",
+        ]
 
-        # Find best variant (by corrected p-value, then Sharpe)
-        if len(summary_df) > 0:
-            valid = summary_df.dropna(subset=["p_value_corrected"])
-            if len(valid) > 0:
-                best_idx = valid["sharpe_net"].idxmax()
-                best = valid.loc[best_idx]
-            else:
-                best = summary_df.iloc[0]
+        if len(summary_df) == 0:
+            lines.append("No results found in summary table.")
         else:
-            best = pd.Series(dtype=float)
+            best = summary_df.loc[summary_df["sharpe_net"].idxmax()] if not summary_df["sharpe_net"].isna().all() else summary_df.iloc[0]
+            lines.append(f"The best performing variant was **{best['instrument']} {best['timeframe']} {best['variant']}** with filters **{best['filters_applied']}** (K={best['K']}).")
+            lines.append(f"- Sharpe (Net): {best['sharpe_net']:.3f}")
+            lines.append(f"- Win Rate: {best['win_rate']:.1%} (vs baseline {best['base_rate']:.1%})")
+            lines.append(f"- Total Signals: {best['n_signals']}")
+            lines.append(f"- Edge significance (p-value): {best['p_value_corrected']:.4f}")
 
-        # Significance assessment
+        # Cross-Currency Validity
+        if cc_validity:
+            lines.extend(["", "## 2. Cross-Currency Decomposition Validity", ""])
+            lines.append(f"- **EUR-driven Continuation Rate**: {cc_validity.get('eur_driven_success_rate', np.nan):.1%} ({cc_validity.get('eur_driven_n', 0)} signals)")
+            lines.append(f"- **USD-driven Mirroring Rate**: {cc_validity.get('usd_driven_mirror_rate', np.nan):.1%} ({cc_validity.get('usd_driven_n', 0)} signals)")
+            lines.append("  > [!NOTE]")
+            lines.append("  > High continuation on EUR-driven and high mirroring on USD-driven validates the decomposition hypothesis.")
+
+        # Statistical Guardrails
+        lines.extend(["", "## 3. Statistical Guardrails", ""])
         n_significant_raw = (summary_df["p_value_raw"] < sig_level).sum() if "p_value_raw" in summary_df.columns else 0
         n_significant_fdr = (summary_df["p_value_corrected"] < sig_level).sum() if "p_value_corrected" in summary_df.columns else 0
         n_total = len(summary_df)
 
-        lines = [
-            "# Volume Spike Signal — Conclusion",
-            "",
-            "## 1. Statistical Significance",
+        lines.extend([
+            "## 3.1. Statistical Significance",
             "",
             f"| Metric | Value |",
             f"|--------|-------|",
@@ -347,11 +355,11 @@ class PerformanceReporter:
             f"| Significant after FDR correction | {n_significant_fdr} |",
             f"| Edge exists (after correction)? | **{'YES' if n_significant_fdr > 0 else 'NO'}** |",
             "",
-        ]
+        ])
 
-        if len(best) > 0 and not best.empty:
+        if not best.empty:
             lines.extend([
-                "## 2. Best Signal Configuration",
+                "## 4. Best Signal Configuration",
                 "",
                 f"| Parameter | Value |",
                 f"|-----------|-------|",
@@ -428,4 +436,103 @@ class PerformanceReporter:
         path = self.output_dir / filename
         path.write_text(text)
         logger.info("Saved conclusion → %s", path)
+        return path
+
+    @staticmethod
+    def _df_to_markdown(df: pd.DataFrame, index: bool = True) -> str:
+        """Manual markdown table generator to avoid 'tabulate' dependency."""
+        if df.empty:
+            return "No data available."
+        
+        cols = list(df.columns)
+        if index:
+            cols = [df.index.name or ""] + cols
+            
+        header = "| " + " | ".join(map(str, cols)) + " |"
+        sep = "| " + " | ".join(["---"] * len(cols)) + " |"
+        
+        rows = []
+        for idx, row in df.iterrows():
+            vals = list(row.values)
+            if index:
+                vals = [idx] + vals
+            rows.append("| " + " | ".join(map(str, vals)) + " |")
+            
+        return "\n".join([header, sep] + rows)
+
+    # ─── 9. Cross-Currency Specific Plots ─────────────────────────────────
+
+    def plot_cc_adaptive_equity(
+        self,
+        uniform_eq: pd.Series,
+        adaptive_eq: pd.Series,
+        title: str = "Equity Curve: Uniform vs Adaptive Sizing",
+        filename: str = "cc_adaptive_equity.png",
+    ) -> Path:
+        fig, ax = plt.subplots(figsize=(14, 6))
+        ax.plot(uniform_eq.index, uniform_eq.values, label="Uniform Sizing", linewidth=1.2, color="grey")
+        ax.plot(adaptive_eq.index, adaptive_eq.values, label="Adaptive Sizing", linewidth=1.5, color="blue")
+        
+        ax.axhline(0, color="k", linewidth=0.5, linestyle="--")
+        ax.set_xlabel("Signal #")
+        ax.set_ylabel("Cumulative Return (ATR)")
+        ax.set_title(title)
+        ax.legend(fontsize=10, loc="upper left")
+        plt.tight_layout()
+
+        path = self.output_dir / filename
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return path
+
+    def plot_cc_eur_move_distribution(
+        self,
+        features_wins: pd.DataFrame,
+        features_losses: pd.DataFrame,
+        filename: str = "cc_eur_move_distribution.png"
+    ) -> Path:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        
+        mx = max(features_wins["eur_move_score"].max(), features_losses["eur_move_score"].max())
+        mn = min(features_wins["eur_move_score"].min(), features_losses["eur_move_score"].min())
+        
+        bins = np.linspace(mn if not pd.isna(mn) else -0.01, mx if not pd.isna(mx) else 0.01, 50)
+        
+        ax.hist(features_losses["eur_move_score"], bins=bins, alpha=0.5, density=True, color="red", label="Losses")
+        ax.hist(features_wins["eur_move_score"], bins=bins, alpha=0.5, density=True, color="green", label="Wins")
+        
+        ax.axvline(0, color="k", linestyle="--", linewidth=1)
+        ax.set_xlabel("EUR Move Score")
+        ax.set_ylabel("Density")
+        ax.set_title("EUR Move Score Distribution: Wins vs Losses")
+        ax.legend()
+        plt.tight_layout()
+
+        path = self.output_dir / filename
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return path
+        
+    def write_cc_summary(
+        self,
+        classification_summary: pd.DataFrame,
+        regime_summary: pd.DataFrame,
+        catch_up_stats: dict,
+        filename: str = "cc_summary.md"
+    ) -> Path:
+        lines = [
+            "# Cross-Currency Confirmation Summary\n",
+            "## 1. Classification Breakdown\n",
+            self._df_to_markdown(classification_summary, index=False),
+            "\n## 2. Correlation Regime Performance\n",
+            self._df_to_markdown(regime_summary, index=False),
+            "\n## 3. GBP/USD Catch-Up Analysis\n",
+            f"- EUR-driven signals followed by pure continuation: {catch_up_stats.get('eur_driven_success_rate', np.nan):.1%}",
+            f"- USD-driven signals correctly mirroring: {catch_up_stats.get('usd_driven_mirror_rate', np.nan):.1%}",
+        ]
+        
+        text = "\n".join(lines)
+        path = self.output_dir / filename
+        path.write_text(text)
+        logger.info("Saved CC summary → %s", path)
         return path

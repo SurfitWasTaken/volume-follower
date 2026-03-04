@@ -68,6 +68,7 @@ class OutcomeCalculator:
         atr_period: int | None = None,
         min_move_atr: float | None = None,
         stop_atr: float | None = None,
+        position_sizes: pd.Series | None = None,
     ) -> pd.DataFrame:
         """
         Compute forward-looking trading outcomes for every signal.
@@ -120,6 +121,10 @@ class OutcomeCalculator:
             if pd.isna(atr_at_signal) or atr_at_signal <= 0:
                 continue
 
+            p_size = 1.0
+            if position_sizes is not None and sig_time in position_sizes.index:
+                p_size = position_sizes.loc[sig_time]
+
             rec = {
                 "signal_time": sig_time,
                 "entry_time": df.index[entry_pos],
@@ -128,7 +133,22 @@ class OutcomeCalculator:
                 "atr": atr_at_signal,
                 "hour": sig_time.hour,
                 "day_of_week": sig_time.weekday(),
+                "position_size": p_size,
             }
+
+            if p_size == 0.0:
+                rec["cc_filter_reason"] = "FILTERED_CC"
+                for K in K_values:
+                    rec[f"win_{K}"] = np.nan
+                    rec[f"mfe_{K}"] = np.nan
+                    rec[f"mae_{K}"] = np.nan
+                    rec[f"mfe_mae_ratio_{K}"] = np.nan
+                    rec[f"htc_return_{K}"] = np.nan
+                    rec[f"time_to_peak_{K}"] = np.nan
+                records.append(rec)
+                continue
+                
+            rec["cc_filter_reason"] = "RETAINED"
 
             for K in K_values:
                 end_pos = min(entry_pos + K, len(df))
@@ -160,10 +180,10 @@ class OutcomeCalculator:
                     exit_close = fwd["close"].iloc[-1]
                     htc = entry_price - exit_close
 
-                # Normalise to ATR units
-                mfe_atr = mfe / atr_at_signal
-                mae_atr = mae / atr_at_signal
-                htc_atr = htc / atr_at_signal
+                # Normalise to ATR units and scale by position size
+                mfe_atr = (mfe / atr_at_signal) * p_size
+                mae_atr = (mae / atr_at_signal) * p_size
+                htc_atr = (htc / atr_at_signal) * p_size
 
                 # Win / loss determination (bar-by-bar)
                 tp_level = min_move * atr_at_signal
@@ -277,6 +297,8 @@ class OutcomeCalculator:
         # Round-trip cost in ATR units
         atr = outcomes["atr"]
         cost_atr = (2 * spread) / atr
+        if "position_size" in outcomes.columns:
+            cost_atr = cost_atr * outcomes["position_size"]
 
         htc_col = f"htc_return_{K}"
         outcomes[f"htc_return_net_{K}"] = outcomes[htc_col] - cost_atr

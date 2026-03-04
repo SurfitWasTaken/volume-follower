@@ -159,6 +159,8 @@ class SignalFilter:
                 mask, directions = self.filter_trend_context(df, mask, directions, **kwargs)
             elif f == "range_position":
                 mask = self.filter_range_position(df, mask, **kwargs)
+            elif f == "cc_eur_driven":
+                mask = self.filter_cc_eur_driven(df, mask, **kwargs)
             else:
                 logger.warning("Unknown filter '%s' — skipped.", f)
                 continue
@@ -349,6 +351,37 @@ class SignalFilter:
             keep = pd.Series(True, index=df.index)
 
         return signals & keep.fillna(False)
+
+    # ----- Filter 8: Cross currency confirmation --------------------------
+
+    @staticmethod
+    def filter_cc_eur_driven(
+        df: pd.DataFrame,
+        signals: pd.Series,
+        cc_features: pd.DataFrame | None = None,
+        **_kwargs,
+    ) -> pd.Series:
+        """
+        Retain only signals classified as EUR-driven.
+        Also drops signals in LOW_CORR regime if configured to do so.
+        """
+        if not CONFIG.get("cc_enabled", False):
+            return signals
+
+        if cc_features is None or cc_features.empty:
+            return signals & False
+            
+        # Ensure cc_features indices match the signal times exactly
+        is_eur_driven = cc_features["is_eur_driven"].reindex(df.index).fillna(False).astype(bool)
+        
+        skip_low = CONFIG.get("cc_skip_low_corr_regime", True)
+        if skip_low:
+            not_low_corr = (cc_features["corr_regime"] != "LOW_CORR").reindex(df.index).fillna(False)
+            keep = is_eur_driven & not_low_corr
+        else:
+            keep = is_eur_driven
+            
+        return signals & keep
 
     # ----- Helpers -------------------------------------------------------
 

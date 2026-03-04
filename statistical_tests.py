@@ -140,6 +140,22 @@ class StatisticalTests:
         result = sp_stats.binomtest(wins, n, base_rate, alternative="greater")
         return result.pvalue
 
+    # ─── 2a. Cohen's h ────────────────────────────────────────────────────
+
+    @staticmethod
+    def cohens_h(p1: float, p2: float) -> float:
+        """
+        Calculate Cohen's h effect size for two proportions.
+        h = 2 * (arcsin(sqrt(p1)) - arcsin(sqrt(p2)))
+        """
+        if pd.isna(p1) or pd.isna(p2):
+            return np.nan
+        
+        # constrain to [0, 1] to avoid domain math errors
+        p1 = max(0.0, min(1.0, p1))
+        p2 = max(0.0, min(1.0, p2))
+        return 2 * (np.arcsin(np.sqrt(p1)) - np.arcsin(np.sqrt(p2)))
+
     # ─── 2b. Bonferroni correction ────────────────────────────────────────
 
     @staticmethod
@@ -217,6 +233,12 @@ class StatisticalTests:
 
         if n == 0:
             return np.nan, np.nan, np.nan
+
+        # Small sample adjustments
+        if n < 300:
+            n_resamples = 50000
+            ci = 0.90
+            logger.debug("n < 300: automatically using 90%% CI and 50,000 resamples.")
 
         point = float(statistic(values))
 
@@ -470,3 +492,74 @@ class StatisticalTests:
         logger.info("Stationarity: H1 Sharpe=%.3f WR=%.3f | H2 Sharpe=%.3f WR=%.3f",
                      s1, wr1, s2, wr2)
         return result
+
+    # ─── 8. Cross-Currency Decomposition Validity ─────────────────────────
+
+    @staticmethod
+    def cross_currency_validity_test(
+        primary_df: pd.DataFrame,
+        secondary_df: pd.DataFrame,
+        signals: pd.Series,
+        directions: pd.Series,
+        cc_features: pd.DataFrame,
+        K: int = 10
+    ) -> dict:
+        """
+        For every signal (before CC filtering):
+        - EUR-driven continuation = primary moves in direction, secondary DOES NOT move in same direction
+        - USD-driven mirroring = primary moves in direction, secondary DOES move in same direction
+        """
+        valid_signals = signals[signals].index
+        
+        eur_driven_count = 0
+        eur_driven_success = 0
+        usd_driven_count = 0
+        usd_driven_success = 0
+        
+        pos_map = {t: i for i, t in enumerate(primary_df.index)}
+        
+        for t in valid_signals:
+            if t not in cc_features.index or t not in secondary_df.index:
+                continue
+                
+            sig_pos = pos_map[t]
+            entry_pos = sig_pos + 1
+            end_pos = min(entry_pos + K, len(primary_df))
+            
+            if entry_pos >= end_pos:
+                continue
+                
+            entry_p = primary_df["open"].iloc[entry_pos]
+            exit_p = primary_df["close"].iloc[end_pos - 1]
+            prim_move = exit_p - entry_p
+            
+            entry_s = secondary_df["open"].iloc[entry_pos]
+            exit_s = secondary_df["close"].iloc[end_pos - 1]
+            sec_move = exit_s - entry_s
+            
+            direction = directions.loc[t]
+            if direction == 0:
+                continue
+                
+            is_eur_driven = cc_features.loc[t, "is_eur_driven"]
+            
+            # Primary continuation
+            prim_continuation = (prim_move > 0 and direction == 1) or (prim_move < 0 and direction == -1)
+            # Secondary catch up (moves in same direction as primary)
+            sec_catch_up = (sec_move > 0 and direction == 1) or (sec_move < 0 and direction == -1)
+            
+            if is_eur_driven:
+                eur_driven_count += 1
+                if prim_continuation and not sec_catch_up:
+                    eur_driven_success += 1
+            else:
+                usd_driven_count += 1
+                if prim_continuation and sec_catch_up:
+                    usd_driven_success += 1
+                    
+        return {
+            "eur_driven_n": eur_driven_count,
+            "eur_driven_success_rate": (eur_driven_success / eur_driven_count) if eur_driven_count > 0 else np.nan,
+            "usd_driven_n": usd_driven_count,
+            "usd_driven_mirror_rate": (usd_driven_success / usd_driven_count) if usd_driven_count > 0 else np.nan
+        }

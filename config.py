@@ -22,7 +22,7 @@ CONFIG = {
     },
 
     # ─── Timeframes ───────────────────────────────────────────────────────
-    "timeframes": ["M1", "M5", "M15"],
+    "timeframes": ["M1", "M5", "M15", "H1", "H4"],
 
     # ─── Data date ranges ─────────────────────────────────────────────────
     "data_start": "2023-01-01",
@@ -74,7 +74,7 @@ CONFIG = {
     # ─── Outcome calculation ──────────────────────────────────────────────
     "K_values": [3, 5, 10, 20, 50],
     "atr_period": 14,
-    "min_move_atr": 0.5,         # Profit target in ATR units
+    "min_move_atr": 1.5,         # Profit target in ATR units
     "stop_distance_atr": 1.0,    # Stop loss in ATR units
 
     # ─── Transaction costs (OANDA spread-based model) ─────────────────────
@@ -94,4 +94,27 @@ CONFIG = {
     # ─── Output ───────────────────────────────────────────────────────────
     "output_dir": "output",
     "data_dir": "data",
+
+    # ─── CROSS CURRENCY EXTENSION ─────────────────────────────────────────
+    "cc_enabled": True,                    # Master switch for the entire extension
+    "cc_secondary_instrument": "GBP_USD",  # Secondary instrument to load
+    "cc_corr_lookback": 20,                # Rolling correlation lookback (candles)
+    "cc_min_eur_move_score": 0.0,          # Min |eur_move_score| to classify as EUR-driven
+    "cc_max_gbpusd_vol_z": 2.5,            # Max GBP/USD vol Z-score for EUR-driven classification
+    "cc_skip_low_corr_regime": True,       # Skip signals in LOW_CORR regime
+    "cc_size_high_corr_mult": 1.5,         # Position multiplier for HIGH_CORR regime
+    "cc_size_med_corr_mult": 1.0,          # Position multiplier for MED_CORR regime
+    "cc_size_low_corr_mult": 0.5,          # Position multiplier for LOW_CORR regime
+    "cc_size_high_eur_move_mult": 1.2,     # Additional multiplier for top-decile eur_move_score
+    "cc_size_low_eur_move_mult": 0.8,      # Multiplier for below-median eur_move_score
+    "cc_size_gbpusd_vol_penalty": 0.5,     # Penalty multiplier for high GBP/USD vol at signal time
+    "cc_size_max_mult": 2.0,               # Maximum position size multiplier
+    "cc_size_min_mult": 0.25,              # Minimum position size multiplier (if trade taken)
+
+    "cc_param_sweep": {
+        "cc_corr_lookback": [10, 20],
+        "cc_min_eur_move_score": [0.0, 0.0001],
+        "cc_max_gbpusd_vol_z": [2.0, 3.0],
+        "cc_skip_low_corr_regime": [True, False]
+    }
 }

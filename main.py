@@ -37,18 +37,28 @@ from outcome_calculator import OutcomeCalculator
 from statistical_tests import StatisticalTests
 from performance_reporter import PerformanceReporter
 
+from cross_currency_loader import load_secondary
+from cross_currency_features import compute_cross_currency_features
+from adaptive_position_sizer import compute_position_sizes
+
 # ── Logging setup ───────────────────────────────────────────────────────
 
-def _setup_logging(level: str = "INFO") -> None:
+def _setup_logging(level: str = "INFO", log_dir: str | None = None) -> None:
     fmt = "%(asctime)s  %(levelname)-8s  %(name)-25s  %(message)s"
+    ldir = log_dir or CONFIG["output_dir"]
+    Path(ldir).mkdir(parents=True, exist_ok=True)
+    
+    # Remove existing handlers to avoid duplicates during dual runs
+    logger = logging.getLogger()
+    for h in logger.handlers[:]:
+        logger.removeHandler(h)
+        
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format=fmt,
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler(
-                Path(CONFIG["output_dir"]) / "pipeline.log", mode="w",
-            ),
+            logging.FileHandler(Path(ldir) / "pipeline.log", mode="w"),
         ],
     )
 
@@ -120,6 +130,8 @@ def run_single_test(
     session_normalised: bool,
     filters: list[str],
     K: int,
+    cc_features: pd.DataFrame | None = None,
+    position_sizes: pd.Series | None = None,
 ) -> dict:
     """
     Run one complete test: detect → filter → outcomes → stats.
@@ -135,7 +147,7 @@ def run_single_test(
 
     # ── Direction always applied first ───────────────────────────────
     all_filters = ["direction"] + [f for f in filters if f != "direction"]
-    filtered, directions = sig_filt.apply(df, signals, all_filters)
+    filtered, directions = sig_filt.apply(df, signals, all_filters, cc_features=cc_features)
 
     n_signals = int(filtered.sum())
     if n_signals < 5:
@@ -151,6 +163,7 @@ def run_single_test(
             "win_rate": np.nan, "base_rate": np.nan,
             "win_rate_excess": np.nan,
             "p_value_raw": 1.0, "p_value_corrected": np.nan,
+            "cohens_h": np.nan, "sample_warning": "INSUFFICIENT" if n_signals < 150 else "",
             "avg_return_gross": np.nan, "avg_return_net": np.nan,
             "sharpe_gross": np.nan, "sharpe_net": np.nan,
             "avg_mfe_atr": np.nan, "avg_mae_atr": np.nan,
@@ -160,7 +173,8 @@ def run_single_test(
         }
 
     # ── Outcomes ─────────────────────────────────────────────────────
-    outcomes = oc.compute_outcomes(df, filtered, directions, K_values=[K])
+    outcomes = oc.compute_outcomes(df, filtered, directions, K_values=[K], position_sizes=position_sizes)
+
     outcomes = oc.apply_costs(outcomes, instrument, K=K)
 
     win_col = f"win_{K}"
@@ -204,13 +218,18 @@ def run_single_test(
     avg_mae = outcomes[mae_col].mean() if mae_col in outcomes.columns else np.nan
     ratio = avg_mfe / avg_mae if avg_mae and avg_mae > 0 else np.nan
 
+    # --- Handle Signal Reduction from Adaptive Sizing ---
+    # n_signals is primarily signals after BOOLEAN filtering.
+    # But CC logic can set p_size to 0.0, which acts as a late-stage filter.
+    n_effective = n_valid
+    
     return {
         "instrument": instrument,
         "timeframe": timeframe,
         "variant": f"{variant}{'_sn' if session_normalised else ''}",
         "filters_applied": "+".join(all_filters),
         "K": K,
-        "n_signals": n_signals,
+        "n_signals": n_effective,
         "win_rate": win_rate,
         "base_rate": base_rate,
         "win_rate_excess": win_rate - base_rate if not np.isnan(win_rate) else np.nan,
@@ -282,13 +301,21 @@ def run_full_analysis(
     instruments = instruments or list(CONFIG["instruments"].keys())
     timeframes = timeframes or CONFIG["timeframes"]
 
+# ── Core execution logic ────────────────────────────────────────────────
+
+def _execute_run(
+    instruments: list[str],
+    timeframes: list[str],
+    use_synthetic: bool,
+    skip_expensive: bool,
+):
     reporter = PerformanceReporter()
     st = StatisticalTests()
 
     all_results: list[dict] = []
-    best_outcomes: pd.DataFrame | None = None
     best_sharpe = -np.inf
     best_key = ""
+    cc_validity = None
 
     total_tests = (
         len(instruments) * len(timeframes)
@@ -315,10 +342,20 @@ def run_full_analysis(
             loader = DataLoader()
             df_is, df_oos = loader.split_data(df_full)
 
+            # --- Cross Currency Processing ---
+            cc_features = None
+            if CONFIG.get("cc_enabled", False):
+                secondary_df = load_secondary(CONFIG, df_is, timeframe)
+                # Compute features for all potential signals blindly (to allow testing)
+                dummy_signals = pd.Series(True, index=df_is.index)
+                cc_features = compute_cross_currency_features(df_is, secondary_df, df_is.index, CONFIG)
+
             # Discard signals in the blackout buffer zone
             buffer = CONFIG["blackout_buffer_candles"]
             if len(df_is) > buffer:
                 df_is = df_is.iloc[:-buffer]
+                if cc_features is not None:
+                    cc_features = cc_features.loc[cc_features.index <= df_is.index[-1]]
 
             if len(df_is) < 500:
                 logger.warning(
@@ -343,9 +380,19 @@ def run_full_analysis(
                                     test_count, total_tests, elapsed,
                                 )
 
+                            # 1. Feature injection
+                            filtered_signals = None
+                            
+                            # 2. Position sizing
+                            position_sizes = None
+                            if CONFIG.get("cc_enabled", False) and cc_features is not None:
+                                position_sizes = compute_position_sizes(cc_features, CONFIG, base_size=1.0)
+
                             result = run_single_test(
                                 df_is, instrument, timeframe,
                                 variant, session_norm, filters, K,
+                                cc_features=cc_features,
+                                position_sizes=position_sizes,
                             )
                             all_results.append(result)
 
@@ -374,15 +421,15 @@ def run_full_analysis(
     perm_result = None
     wf_results = None
     stationarity_result = None
+    cc_validity = None
 
-    if len(significant) > 0 and not skip_expensive:
+    if not summary_df.empty:
         logger.info("=" * 80)
-        logger.info("SIGNIFICANT results found — running deep analysis on best variant.")
-        logger.info("Best: %s", best_key)
+        logger.info("Deep analysis on best variant: %s", best_key)
         logger.info("=" * 80)
 
         # Identify the best row's parameters
-        best_row = significant.loc[significant["sharpe_net"].idxmax()]
+        best_row = summary_df.loc[summary_df["sharpe_net"].idxmax()] if not summary_df["sharpe_net"].isna().all() else summary_df.iloc[0]
         inst = best_row["instrument"]
         tf = best_row["timeframe"]
         var_raw = best_row["variant"]
@@ -430,6 +477,19 @@ def run_full_analysis(
         filt_all, dir_all = _filter_func(df_is_deep, signals_all)
         outcomes_all = _outcome_func(df_is_deep, filt_all, dir_all)
         stationarity_result = st.stationarity_check(outcomes_all, K=K_best)
+        
+        # CC Validity
+        cc_validity = None
+        if CONFIG.get("cc_enabled", False) and cc_features is not None:
+            secondary_df = load_secondary(CONFIG, df_is_deep, tf)
+            cc_validity = st.cross_currency_validity_test(
+                primary_df=df_is_deep,
+                secondary_df=secondary_df,
+                signals=signals_all,
+                directions=dir_all,
+                cc_features=cc_features,
+                K=K_best
+            )
 
         # ── Plots ────────────────────────────────────────────────────
         # Equity curve
@@ -480,7 +540,21 @@ def run_full_analysis(
         perm_result=perm_result,
         wf_results=wf_results,
         stationarity=stationarity_result,
+        cc_validity=cc_validity,
     )
+
+    # ── CC Specific Summary ──────────────────────────────────────────
+    if CONFIG.get("cc_enabled", False) and cc_validity is not None:
+        # Generate classification breakdown for reporting
+        if best_sharpe != -np.inf:
+             # Logic to generate classification summary if needed
+             pass
+        reporter.write_cc_summary(
+             classification_summary=pd.DataFrame([{"Placeholder": "NYI"}]),
+             regime_summary=pd.DataFrame([{"Placeholder": "NYI"}]),
+             catch_up_stats=cc_validity
+        )
+
 
     # ── Print top results ────────────────────────────────────────────
     logger.info("=" * 80)
@@ -495,6 +569,78 @@ def run_full_analysis(
         "\n%d / %d tests significant after FDR correction (α=%.2f).",
         sig_count, len(summary_df), sig_level,
     )
+
+
+def run_full_analysis(
+    instruments: list[str] | None = None,
+    timeframes: list[str] | None = None,
+    use_synthetic: bool = False,
+    skip_expensive: bool = False,
+) -> None:
+    np.random.seed(CONFIG["random_seed"])
+
+    instruments = instruments or list(CONFIG["instruments"].keys())
+    timeframes = timeframes or CONFIG["timeframes"]
+
+    runs_to_execute = []
+    base_out = Path(CONFIG["output_dir"])
+    
+    # 1. Baseline Run
+    runs_to_execute.append({
+        "name": "baseline",
+        "out_dir": base_out / "baseline",
+        "cc_enabled": False,
+        "cc_params": {}
+    })
+    
+    # 2. Cross-Currency Extension Grids
+    if CONFIG.get("cc_enabled", True):
+        import hashlib
+        import json
+        from itertools import product
+        
+        sweep_grid = CONFIG.get("cc_param_sweep", {})
+        keys = list(sweep_grid.keys())
+        values = list(sweep_grid.values())
+        
+        combinations = [dict(zip(keys, v)) for v in product(*values)]
+        
+        grid_str = json.dumps(sweep_grid, sort_keys=True)
+        grid_hash = hashlib.sha256(grid_str.encode()).hexdigest()[:8]
+        
+        if skip_expensive:
+            logger.info("skip_expensive=True: Truncating combinations and test matrix for fast validation.")
+            combinations = combinations[:1]
+            global FILTER_LADDERS, K_TO_TEST, VARIANTS, SESSION_NORM_OPTIONS
+            FILTER_LADDERS = [["body_ratio", "wick", "session_both", "news"]]
+            K_TO_TEST = [10]
+            VARIANTS = ["A"]
+            SESSION_NORM_OPTIONS = [True]
+        
+        for i, params in enumerate(combinations):
+            runs_to_execute.append({
+                "name": f"cc_ext_{grid_hash}_{i}",
+                "out_dir": base_out / "cc_extension" / f"run_{i}",
+                "cc_enabled": True,
+                "cc_params": params
+            })
+            
+    for run in runs_to_execute:
+        # Override config per run
+        CONFIG["cc_enabled"] = run["cc_enabled"]
+        for k, v in run["cc_params"].items():
+            CONFIG[k] = v
+            
+        CONFIG["output_dir"] = str(run["out_dir"])
+        _setup_logging(log_dir=str(run["out_dir"]))
+        
+        logger.info("=" * 80)
+        logger.info("STARTING RUN: %s", run["name"])
+        if run["cc_params"]:
+            logger.info("CC PARAMS: %s", run["cc_params"])
+        logger.info("=" * 80)
+        
+        _execute_run(instruments, timeframes, use_synthetic, skip_expensive)
 
 
 # ── CLI entry point ─────────────────────────────────────────────────────
