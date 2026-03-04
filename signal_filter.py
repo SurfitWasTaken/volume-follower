@@ -178,12 +178,21 @@ class SignalFilter:
     def filter_direction(
         df: pd.DataFrame, signals: pd.Series
     ) -> tuple[pd.Series, pd.Series]:
-        """Classify each spike candle as bullish (+1) or bearish (-1)."""
+        """Classify each spike candle as bullish (+1) or bearish (-1).
+
+        When CONFIG["mean_reversion"] is True, directions are flipped:
+        bullish spike → short (−1), bearish spike → long (+1).
+        """
         directions = pd.Series(0, index=df.index, dtype=int)
         bullish = df["close"] > df["open"]
         bearish = df["close"] < df["open"]
         directions[signals & bullish] = 1
         directions[signals & bearish] = -1
+
+        # Mean-reversion mode: flip trade direction
+        if CONFIG.get("mean_reversion", False):
+            directions = directions * -1
+            logger.info("  [MEAN-REVERSION] Directions flipped: bullish→short, bearish→long")
 
         # Remove doji-like candles where close == open exactly
         mask = signals & (directions != 0)

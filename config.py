@@ -71,6 +71,11 @@ CONFIG = {
     # Filter 7 — Prior range position
     "range_lookback": 20,
 
+    # ─── Direction mode ────────────────────────────────────────────────────
+    # When True, trade direction is FLIPPED: bullish spike → short,
+    # bearish spike → long (mean-reversion hypothesis).
+    "mean_reversion": False,
+
     # ─── Outcome calculation ──────────────────────────────────────────────
     "K_values": [3, 5, 10, 20, 50],
     "atr_period": 14,
