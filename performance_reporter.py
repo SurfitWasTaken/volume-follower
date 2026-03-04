@@ -39,6 +39,84 @@ class PerformanceReporter:
         self.output_dir = Path(output_dir or CONFIG["output_dir"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # ─── V2: Minimum sample gate ─────────────────────────────────────────
+
+    def _check_min_n(self, n_signals: int, filename: str) -> bool:
+        """Return True if n is sufficient for chart generation.
+        If not, write a placeholder image and return False."""
+        min_n = CONFIG.get("n_min_signals_chart", 100)
+        if n_signals >= min_n:
+            return True
+
+        # Generate a plain text "not reportable" image
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.text(
+            0.5, 0.5,
+            f"⚠ RESULT NOT REPORTABLE\n"
+            f"n = {n_signals} (minimum required: {min_n})\n\n"
+            f"No chart will be generated for results\n"
+            f"below the minimum observation threshold.",
+            ha='center', va='center', fontsize=16,
+            fontweight='bold', color='red',
+            transform=ax.transAxes,
+            bbox=dict(boxstyle='round', facecolor='lightyellow', edgecolor='red'),
+        )
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis('off')
+        path = self.output_dir / filename
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        logger.warning(
+            "Chart suppressed (%s): n=%d < min=%d",
+            filename, n_signals, min_n,
+        )
+        return False
+
+    def write_insufficient_result(
+        self,
+        instrument: str,
+        timeframe: str,
+        n_signals: int,
+        reason: str = "",
+    ) -> Path:
+        """
+        Write a RESULT_INVALID_INSUFFICIENT_DATA.md file
+        instead of the normal report suite.
+        """
+        min_n = CONFIG.get("n_min_signals", 150)
+        lines = [
+            f"# ⚠ RESULT INVALID — INSUFFICIENT DATA\n",
+            f"**{instrument} {timeframe}**: {n_signals} signals "
+            f"(minimum required: {min_n})\n",
+            "",
+            "## Why This File Exists Instead of a Report\n",
+            "The pipeline detected that the number of signals generated "
+            "from the available data is below the minimum threshold for "
+            "any statistical claim to be made. To prevent false confidence, "
+            "no charts, Sharpe ratios, equity curves, or conclusions have "
+            "been generated.\n",
+            "",
+            "## What You Need\n",
+            f"- At least **{min_n}** post-filter signals",
+            f"- Current: **{n_signals}** signals",
+            f"- Shortfall: **{min_n - n_signals}** signals",
+            "",
+            "## Options\n",
+            "1. **Fetch more history** — increase `max_history_years` in config",
+            "2. **Relax filters** — remove restrictive filters from the ladder",
+            "3. **Use lower timeframes** — if cost-viable (check preflight)",
+            "4. **Accept the result** — set `force_run_insufficient_data: True` "
+            "(all outputs will carry a WARNING banner)",
+        ]
+        if reason:
+            lines.extend(["", f"**Additional context:** {reason}"])
+
+        path = self.output_dir / "RESULT_INVALID_INSUFFICIENT_DATA.md"
+        path.write_text("\n".join(lines))
+        logger.info("Wrote insufficient data notice → %s", path)
+        return path
+
     # ─── 1. Summary table ────────────────────────────────────────────────
 
     @staticmethod
@@ -91,6 +169,10 @@ class PerformanceReporter:
         equity_dict : {label: pd.Series of cumulative returns}
         """
         fig, ax = plt.subplots(figsize=(14, 6))
+
+        total_signals = sum(len(eq) for eq in equity_dict.values())
+        if not self._check_min_n(total_signals, filename):
+            return self.output_dir / filename
 
         for label, eq in equity_dict.items():
             ax.plot(eq.index, eq.values, label=label, linewidth=1.2)
@@ -310,16 +392,65 @@ class PerformanceReporter:
         wf_results: list[dict] | None = None,
         stationarity: dict | None = None,
         cc_validity: dict | None = None,
+        red_flag_reports: list | None = None,
+        checkpoint_warnings: list[str] | None = None,
         filename: str = "conclusion.md",
     ) -> Path:
         """
         Synthesise all results into a final markdown report.
+        V2: Leads with Data Adequacy Assessment and Red Flag header.
         """
         sig_level = CONFIG["significance_level"]
         lines = [
             "# Backtest Conclusion & Strategy Assessment\n",
-            "## 1. Executive Summary\n",
         ]
+
+        # ─── V2: Checkpoint warnings banner ───────────────────────────────
+        if checkpoint_warnings:
+            lines.append("> [!CAUTION]")
+            lines.append("> ⚠ THIS RUN HAD CHECKPOINT FAILURES. SEE pipeline_log.json.")
+            for w in checkpoint_warnings:
+                lines.append(f"> - {w}")
+            lines.append("")
+
+        # ─── V2: Red flag header ─────────────────────────────────────────
+        if red_flag_reports:
+            total_flags = sum(r.n_flags for r in red_flag_reports)
+            total_critical = sum(r.n_critical for r in red_flag_reports)
+            if total_flags > 0:
+                lines.append(
+                    f"## ⚠ {total_flags} RED FLAG{'S' if total_flags > 1 else ''} "
+                    f"TRIGGERED ({total_critical} CRITICAL) — READ BEFORE INTERPRETING RESULTS\n"
+                )
+                # Show flags from the best result
+                for report in red_flag_reports:
+                    if report.n_flags > 0:
+                        lines.append(report.to_markdown())
+                        break  # Only show the top one in the header
+                lines.append("")
+
+        # ─── V2: Data Adequacy Assessment (FIRST section) ────────────────
+        n_min = CONFIG.get("n_min_signals", 150)
+        best_n = int(summary_df["n_signals"].max()) if len(summary_df) > 0 and not summary_df["n_signals"].isna().all() else 0
+        # Estimate signals per year from the data
+        sig_per_year = "N/A"
+        avail_years = "N/A"
+        wf_windows = len(wf_results) if wf_results else 0
+        wf_min = CONFIG.get("wf_min_windows", 6)
+
+        lines.extend([
+            "## ⚠ Data Adequacy Assessment\n",
+            "| Metric | Value | Threshold | Status |",
+            "|--------|-------|-----------|--------|",
+            f"| Total signals (best config) | {best_n} | {n_min} | {'✅' if best_n >= n_min else '❌'} |",
+            f"| Walk-forward windows | {wf_windows} | {wf_min} | {'✅' if wf_windows >= wf_min else '❌'} |",
+            "",
+            "**If any row shows ❌, the findings below are preliminary and statistically underpowered.**\n",
+            "",
+        ])
+
+        # ─── Original content below, now AFTER the adequacy assessment ───
+        lines.append("## 1. Executive Summary\n")
 
         if len(summary_df) == 0:
             lines.append("No results found in summary table.")

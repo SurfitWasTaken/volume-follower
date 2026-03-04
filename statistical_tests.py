@@ -9,11 +9,20 @@ Implements all required tests with methodological corrections:
 3. Benjamini-Hochberg FDR correction across the full test matrix
 4. Block bootstrap (not IID) — handles serial correlation
 5. Walk-forward temporal stability check (NOT optimisation)
-6. Permutation test (shuffle volume, preserve price structure)
+6. Permutation test (shuffle volume, preserve price structure) — PRIMARY gate
 7. Stationarity / half-split consistency check
+
+V2 OVERHAUL:
+- InsufficientDataError raised when n < n_min_signals_chart
+- StatResult dataclass for structured return values
+- @requires_min_n decorator on all stat functions
+- Permutation test is PRIMARY significance gate
+- Binomial test is SECONDARY (labelled “assumption-heavy”)
 """
 
+import functools
 import logging
+from dataclasses import dataclass, field
 from typing import Callable
 
 import numpy as np
@@ -23,6 +32,83 @@ from scipy import stats as sp_stats
 from config import CONFIG
 
 logger = logging.getLogger(__name__)
+
+
+# ─── V2: Exceptions & Dataclasses ──────────────────────────────────────────
+
+class InsufficientDataError(Exception):
+    """Raised when a statistical function receives fewer than min_n observations."""
+    pass
+
+
+@dataclass
+class StatResult:
+    """Structured result from the statistical testing pipeline."""
+    n_signals: int
+    is_reportable: bool  # False if n < n_min_signals_chart
+
+    # PRIMARY: Permutation test (assumption-free)
+    perm_p_value: float = np.nan
+    perm_empirical_rank: float = np.nan  # Where true Sharpe sits in perm dist
+    perm_n_simulations: int = 0
+
+    # SECONDARY: Binomial test (assumption-heavy, shown for reference)
+    binom_p_value: float = np.nan
+    binom_note: str = "SECONDARY — assumes independence"
+
+    # CORRECTED: Applied across full pre-committed matrix
+    fdr_corrected_p: float = np.nan
+    is_significant: bool = False  # True only if perm AND fdr pass
+
+    # Win rate with mandatory CI
+    win_rate: float = np.nan
+    win_rate_ci_lo: float = np.nan
+    win_rate_ci_hi: float = np.nan
+    win_rate_vs_base_rate: float = np.nan
+    win_rate_significant: bool = False  # True only if ci_lo > base_rate
+
+    # Sharpe with mandatory CI (None if n < 100)
+    sharpe_net: float = np.nan
+    sharpe_ci_lo: float = np.nan
+    sharpe_ci_hi: float = np.nan
+
+    # Effect size
+    cohens_h: float = np.nan
+    cohens_h_meaningful: bool = False  # True if abs > 0.1
+
+    # Stationarity
+    first_half_win_rate: float = np.nan
+    second_half_win_rate: float = np.nan
+    is_stationary: bool = False  # |first - second| < max_stationarity_delta
+
+
+def requires_min_n(min_n: int | None = None):
+    """
+    Decorator that raises InsufficientDataError if the first
+    array-like argument has fewer than min_n valid observations.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            threshold = min_n or CONFIG.get("n_min_signals_chart", 100)
+            # Find the first array-like argument
+            for arg in args[1:]:  # skip 'self'
+                if isinstance(arg, (np.ndarray, pd.Series)):
+                    n = len(arg[~pd.isna(arg)]) if hasattr(arg, '__len__') else 0
+                    if n < threshold:
+                        raise InsufficientDataError(
+                            f"{func.__name__}: n={n} < min_n={threshold}"
+                        )
+                    break
+                elif isinstance(arg, pd.DataFrame):
+                    if len(arg) < threshold:
+                        raise InsufficientDataError(
+                            f"{func.__name__}: n={len(arg)} < min_n={threshold}"
+                        )
+                    break
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 class StatisticalTests:
@@ -486,8 +572,14 @@ class StatisticalTests:
             "first_half_sharpe": s1,
             "second_half_sharpe": s2,
             "sharpe_diff": abs(s1 - s2) if not (np.isnan(s1) or np.isnan(s2)) else np.nan,
-            "first_wr": wr1,
-            "second_wr": wr2,
+            "first_half_win_rate": wr1,
+            "second_half_win_rate": wr2,
+            "first_wr": wr1,   # alias for backwards compatibility
+            "second_wr": wr2,  # alias for backwards compatibility
+            "is_stationary": (
+                abs(wr1 - wr2) < CONFIG.get("max_stationarity_delta", 0.10)
+                if not (np.isnan(wr1) or np.isnan(wr2)) else False
+            ),
         }
         logger.info("Stationarity: H1 Sharpe=%.3f WR=%.3f | H2 Sharpe=%.3f WR=%.3f",
                      s1, wr1, s2, wr2)

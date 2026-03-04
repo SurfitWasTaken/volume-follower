@@ -116,5 +116,27 @@ CONFIG = {
         "cc_min_eur_move_score": [0.0, 0.0001],
         "cc_max_gbpusd_vol_z": [2.0, 3.0],
         "cc_skip_low_corr_regime": [True, False]
-    }
+    },
+
+    # ─── V2 OVERHAUL: PRE-COMMITMENT PARAMETERS ─────────────────────────
+    # These must be set before any data is seen.  Changing them after
+    # pipeline start triggers a contamination flag.
+    "primary_timeframe": "H1",            # LOCKED.  Change requires re-running preflight.
+    "secondary_timeframes": [],           # Validation only, never used for hypothesis selection.
+    "max_history_years": 5,               # Fetch up to 5 years of history (OANDA practice limit).
+    "n_min_signals": 150,                 # Hard minimum for reportable results.
+    "n_min_signals_chart": 100,           # Hard minimum to generate any chart.
+    "force_run_insufficient_data": False, # Override gate (flags ALL outputs as WARNING).
+    "pre_commitment_hash": None,          # Auto-populated by pre_commitment_log.py.
+
+    # ─── V2 OVERHAUL: WALK-FORWARD PARAMETERS ───────────────────────────
+    "wf_train_months": 18,                # Training window for walk-forward.
+    "wf_test_months": 3,                  # Test window for walk-forward.
+    "wf_min_windows": 6,                  # Minimum walk-forward windows required.
+
+    # ─── V2 OVERHAUL: RED FLAG THRESHOLDS ────────────────────────────────
+    "max_reportable_sharpe": 5.0,         # Sharpe above this triggers automatic review.
+    "min_cohens_h": 0.05,                 # Effect size minimum for economic significance.
+    "max_stationarity_delta": 0.10,       # Max win rate difference between time halves.
+    "cost_viability_max_be_wr": 0.60,     # Max break-even WR for a timeframe to be viable.
 }

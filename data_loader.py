@@ -55,9 +55,11 @@ class DataLoader:
 
     MAX_CANDLES_PER_REQUEST = 5000
     MAX_DAYS_PER_CHUNK = {
-        "M1": 3,    # ~4320 candles per 3 days
-        "M5": 10,   # ~2880 candles per 10 days
-        "M15": 30,  # ~2880 candles per 30 days
+        "M1": 3,     # ~4320 candles per 3 days
+        "M5": 10,    # ~2880 candles per 10 days
+        "M15": 30,   # ~2880 candles per 30 days
+        "H1": 100,   # ~2400 candles per 100 days
+        "H4": 365,   # ~2190 candles per 365 days
     }
 
     def __init__(self, data_dir: str | None = None):
@@ -201,6 +203,146 @@ class DataLoader:
 
         df.to_csv(csv_path)
         logger.info("Saved %d candles → %s", len(df), csv_path)
+        return df
+
+    # ---- Max history fetch (V2 overhaul) ---------------------------------
+
+    def fetch_max_history(
+        self,
+        instrument: str,
+        granularity: str,
+        max_years: int | None = None,
+        force: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Fetch the maximum available history from OANDA by paginating
+        backwards from today.
+
+        Parameters
+        ----------
+        instrument : str
+        granularity : str
+        max_years : int
+            Maximum years of history to fetch.  Default from CONFIG.
+        force : bool
+            Re-download even if cache exists.
+
+        Returns
+        -------
+        pd.DataFrame
+        """
+        max_years = max_years or CONFIG.get("max_history_years", 5)
+        end_dt = pd.Timestamp.now(tz="UTC").normalize()
+        start_dt = end_dt - pd.DateOffset(years=max_years)
+
+        logger.info(
+            "Fetching max history for %s %s: %s → %s (%d years)",
+            instrument, granularity, start_dt.date(), end_dt.date(), max_years,
+        )
+
+        return self.fetch_from_oanda(
+            instrument=instrument,
+            granularity=granularity,
+            start=str(start_dt.date()),
+            end=str(end_dt.date()),
+            force=force,
+        )
+
+    # ---- Data density validation (V2 overhaul) ---------------------------
+
+    @staticmethod
+    def validate_density(
+        df: pd.DataFrame,
+        timeframe: str,
+        window_months: int = 6,
+    ) -> list[dict]:
+        """
+        Check data density per window_months-period.
+
+        Returns a list of dicts with period info and density pct.
+        Logs warnings for any period with density < 90%.
+        """
+        if len(df) == 0:
+            return []
+
+        # Expected candles per trading hour
+        tf_minutes = {"M1": 1, "M5": 5, "M15": 15, "H1": 60, "H4": 240}
+        mins = tf_minutes.get(timeframe, 60)
+        # ~252 trading days/yr, ~22hrs/day for forex
+        candles_per_month = int(252 / 12 * 22 * 60 / mins)
+
+        results = []
+        start = df.index.min()
+        end = df.index.max()
+        cursor = start
+
+        while cursor < end:
+            window_end = cursor + pd.DateOffset(months=window_months)
+            window = df[(df.index >= cursor) & (df.index < window_end)]
+            expected = candles_per_month * window_months
+            actual = len(window)
+            density = actual / expected if expected > 0 else 0
+
+            result = {
+                "period_start": str(cursor.date()),
+                "period_end": str(min(window_end, end).date()),
+                "actual_candles": actual,
+                "expected_candles": expected,
+                "density_pct": round(density * 100, 1),
+            }
+            results.append(result)
+
+            if density < 0.90:
+                logger.warning(
+                    "Low data density: %s → %s: %.1f%% (%d/%d candles)",
+                    result["period_start"], result["period_end"],
+                    density * 100, actual, expected,
+                )
+
+            cursor = window_end
+
+        return results
+
+    # ---- Data summary report (V2 overhaul) -------------------------------
+
+    @staticmethod
+    def write_data_summary(
+        df: pd.DataFrame,
+        instrument: str,
+        timeframe: str,
+        density_results: list[dict],
+        output_dir: str | None = None,
+    ) -> None:
+        """Write data summary to output/preflight/data_summary.md."""
+        from pathlib import Path
+        out = Path(output_dir or CONFIG["output_dir"]) / "preflight"
+        out.mkdir(parents=True, exist_ok=True)
+
+        lines = [
+            f"# Data Summary: {instrument} {timeframe}\n",
+            f"| Metric | Value |",
+            f"|--------|-------|",
+            f"| Date range | {df.index.min()} → {df.index.max()} |",
+            f"| Total candles | {len(df):,} |",
+            f"| Duration | {(df.index.max() - df.index.min()).days:,} days |",
+            f"| Zero-volume candles | {(df['volume'] == 0).sum()} |",
+            "",
+            "## Density by Period",
+            "",
+            "| Period | Actual | Expected | Density |",
+            "|--------|--------|----------|----------|",
+        ]
+        for d in density_results:
+            flag = " ⚠" if d["density_pct"] < 90 else ""
+            lines.append(
+                f"| {d['period_start']} – {d['period_end']} | "
+                f"{d['actual_candles']:,} | {d['expected_candles']:,} | "
+                f"{d['density_pct']:.1f}%{flag} |"
+            )
+
+        path = out / "data_summary.md"
+        path.write_text("\n".join(lines))
+        logger.info("Data summary → %s", path)
         return df
 
     # ---- CSV I/O ---------------------------------------------------------
